@@ -99,7 +99,21 @@ export class UserStorageService implements UserRepository {
   }
 
   public getAll(): Observable<StoredUser[]> {
-    return this.fetchFromApi().pipe(catchError(() => of(this.readLocal())));
+    // En Vercel /tmp es efimero por instancia, por lo que el txt del servidor
+    // puede no contener usuarios creados en otra instancia. Se mergea con
+    // localStorage para que el login funcione en el mismo navegador aunque el
+    // txt server-side sea efimero. Cuando se migre a DB, este merge desaparece.
+    return this.fetchFromApi().pipe(
+      map(apiUsers => {
+        const local = this.readLocal();
+        const merged = [...apiUsers];
+        for (const u of local) {
+          if (!merged.some(m => m.email === u.email)) merged.push(u);
+        }
+        return merged;
+      }),
+      catchError(() => of(this.readLocal()))
+    );
   }
 
   /**

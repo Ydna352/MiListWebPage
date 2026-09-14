@@ -270,15 +270,30 @@ export class AuthService {
     }
     // Intento server-side primero (funciona cross-browser y guarda en txt)
     return this.http.post<{ saved: boolean }>(AuthService.COMPLETE_REGISTRATION_ENDPOINT, { token, password: newPassword }).pipe(
-      map(() => {
-        // Marcar token local como usado también si existe
-        try {
-          const tokens = this.readRegisterTokens().map(t => t.token === token ? { ...t, usedAt: Date.now() } : t);
-          this.writeJson(AuthService.REGISTER_TOKENS_KEY, tokens);
-        } catch {}
-        this.logout();
-        return void 0;
-      }),
+      switchMap(() => this.userStorage.hashPassword$(newPassword).pipe(
+        map(hash => {
+          // Guardar espejo en localStorage para que login funcione aunque /tmp sea efimero en Vercel
+          try {
+            const decoded = this.decodeRegistrationToken(token);
+            const email = decoded?.email || '';
+            if (email) {
+              const users = this.readUsers();
+              const idx = users.findIndex(u => u.email === email.toLowerCase());
+              const rec: StoredUser = { email: email.toLowerCase(), name: email.split('@')[0], password: hash };
+              if (idx >= 0) users[idx] = rec; else users.push(rec);
+              this.writeJson(AuthService.USERS_KEY, users);
+              // tambien sincronizar via UserStorage para formato txt espejo
+              try { localStorage.setItem('app.usersTxt', users.map(u => `${u.email}|${u.password}|${u.name}`).join('\n')); } catch {}
+            }
+          } catch {}
+          try {
+            const tokens = this.readRegisterTokens().map(t => t.token === token ? { ...t, usedAt: Date.now() } : t);
+            this.writeJson(AuthService.REGISTER_TOKENS_KEY, tokens);
+          } catch {}
+          this.logout();
+          return void 0;
+        })
+      )),
       catchError((err) => {
         const serverMsg = err?.error?.error;
         // Si es error de validación del servidor (token inválido, caducado, duplicado) propagar
@@ -334,6 +349,23 @@ export class AuthService {
     const random = new Uint8Array(16);
     crypto.getRandomValues(random);
     return Array.from(random).map(byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  private decodeRegistrationToken(token: string): { email: string } | null {
+    try {
+      let b64 = token.replace(/-/g, '+').replace(/_/g, '/');
+      const pad = b64.length % 4;
+      if (pad) b64 += '='.repeat(4 - pad);
+      const raw = atob(b64);
+      const parts = raw.split('|');
+      if (parts.length >= 2 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(parts[0])) return { email: parts[0] };
+    } catch {}
+    try {
+      const list = this.readRegisterTokens();
+      const found = list.find(t => t.token === token);
+      if (found) return { email: found.email };
+    } catch {}
+    return null;
   }
 
   private normalizeEmail(email: string): string { return email.trim().toLowerCase(); }
