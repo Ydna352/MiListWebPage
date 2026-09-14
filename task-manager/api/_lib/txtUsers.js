@@ -154,7 +154,7 @@ function ensureSeed() {
   const users = readUsers();
   if (users.length === 0) {
     // Usuario demo semilla, con hash para no dejar texto plano en el txt desplegado
-    const demoHash = hashPassword('demo1234');
+    const demoHash = hashPassword('demo12345');
     upsertUser('edgarrobles076@gmail.com', demoHash, 'Usuario Demo');
   }
 }

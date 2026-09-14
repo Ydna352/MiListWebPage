@@ -29,6 +29,9 @@
  * =============================================================================
  */
 
+const txt = require('./_lib/txtUsers');
+const regTokens = require('./_lib/registerTokens');
+
 const MAX_TOKEN_LENGTH = 100;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -36,12 +39,6 @@ module.exports = async function handler(request, response) {
   if (request.method !== 'POST') {
     response.setHeader('Allow', 'POST');
     return response.status(405).json({ error: 'Metodo no permitido.' });
-  }
-
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) {
-    console.error('[send-register-email] Falta RESEND_API_KEY.');
-    return response.status(500).json({ error: 'El servicio de correo no esta configurado.' });
   }
 
   const body = typeof request.body === 'string' ? safeParse(request.body) : request.body;
@@ -55,11 +52,32 @@ module.exports = async function handler(request, response) {
     return response.status(400).json({ error: 'Token no valido.' });
   }
 
+  // Validar que no exista ya (seguridad server-side extra, el cliente ya lo valida)
+  try { txt.ensureSeed(); } catch {}
+  if (txt.exists(email)) {
+    return response.status(409).json({ error: 'El correo ya esta registrado.' });
+  }
+
+  // Persistir token en servidor (txt) para que el enlace funcione en cualquier navegador
+  try {
+    regTokens.upsertToken(token, email);
+  } catch (e) {
+    console.error('[send-register-email] No se pudo persistir token', e);
+    return response.status(500).json({ error: 'No se pudo generar el enlace.' });
+  }
+
   const protocol = request.headers['x-forwarded-proto'] || 'https';
   const host = request.headers['x-forwarded-host'] || request.headers.host;
   if (!host) return response.status(400).json({ error: 'No se pudo determinar el dominio.' });
 
   const registerUrl = `${protocol}://${host}/completar-registro?token=${encodeURIComponent(token)}`;
+
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    console.error('[send-register-email] Falta RESEND_API_KEY - token guardado, modo demo activo.');
+    // No es error fatal: el usuario puede completar con el link demo, pero avisamos
+    return response.status(200).json({ sent: false, warning: 'Correo no configurado, usa el enlace demo.' });
+  }
 
   try {
     const resendResponse = await fetch('https://api.resend.com/emails', {

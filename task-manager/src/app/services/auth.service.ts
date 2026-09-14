@@ -47,11 +47,12 @@ export class AuthService {
   private static readonly TOKEN_TTL_MS = 15 * 60 * 1000;
   private static readonly SEND_EMAIL_ENDPOINT = '/api/send-reset-email';
   private static readonly SEND_REGISTER_ENDPOINT = '/api/send-register-email';
+  private static readonly COMPLETE_REGISTRATION_ENDPOINT = '/api/complete-registration';
   public static readonly MIN_PASSWORD_LENGTH = 8;
   public static readonly DEMO_USER: StoredUser = {
     email: 'edgarrobles076@gmail.com',
     name: 'Usuario Demo',
-    password: 'demo1234'
+    password: 'demo12345'
   };
 
   private readonly http = inject(HttpClient);
@@ -209,36 +210,89 @@ export class AuthService {
   }
 
   private sendRegisterEmail(email: string, token: string): Observable<boolean> {
-    return this.http.post<{ sent: boolean }>(AuthService.SEND_REGISTER_ENDPOINT, { email, token }).pipe(map(() => true), catchError(() => of(false)));
+    return this.http.post<{ sent: boolean; warning?: string }>(AuthService.SEND_REGISTER_ENDPOINT, { email, token }).pipe(
+      map(res => !!res?.sent),
+      catchError((err) => {
+        // Si el servidor dice 409 el correo ya existe -> propagar error, no silenciar
+        const msg = err?.error?.error || err?.message || '';
+        if (err?.status === 409 || /ya esta registrado/i.test(msg)) {
+          // Lanzar para que requestRegistration muestre el error en la UI
+          throw new Error('El correo ya esta registrado. Intenta iniciar sesion o recupera tu contrasena.');
+        }
+        return of(false);
+      })
+    );
   }
 
   /**
    * Valida un token de registro antes de mostrar el formulario de contraseña.
+   * Intenta primero contra el servidor (txt) para que funcione cross-browser;
+   * si no hay servidor (ng serve) cae a localStorage.
    */
   public validateRegistrationToken(token: string): Observable<string> {
-    return this.simulateRequest(() => this.consumeTokenChecks(token, AuthService.REGISTER_TOKENS_KEY).email);
+    return this.http.get<{ valid: boolean; email: string }>(`${AuthService.COMPLETE_REGISTRATION_ENDPOINT}?token=${encodeURIComponent(token)}`).pipe(
+      map(res => {
+        if (!res?.email) throw new Error('El enlace no es valido.');
+        return res.email;
+      }),
+      catchError((err) => {
+        // Si el servidor respondió con error de token, propagarlo
+        const serverMsg = err?.error?.error;
+        if (serverMsg) throw new Error(serverMsg);
+        // Fallback local (ng serve sin API)
+        if (err?.status === 404 || err?.status === 0) {
+          return this.simulateRequest(() => this.consumeTokenChecks(token, AuthService.REGISTER_TOKENS_KEY).email);
+        }
+        // Otro error de red -> intentar fallback local
+        try {
+          return of(this.consumeTokenChecks(token, AuthService.REGISTER_TOKENS_KEY).email);
+        } catch (e) { throw e; }
+      })
+    );
   }
 
   /**
    * Completa el registro creando el usuario con contraseña hasheada.
-   *
-   * Valida el token, exige minimo 8 caracteres, hashea la contraseña y persiste
-   * el nuevo usuario via UserStorageService (que escribe en el TXT). Marca el
-   * token como usado y cierra cualquier sesion abierta.
+   * Flujo server-side优先: POST /api/complete-registration persiste en usuarios.txt
+   * y consume el token del txt. Fallback local para ng serve.
    */
   public completeRegistration(token: string, newPassword: string): Observable<void> {
     if (newPassword.length < AuthService.MIN_PASSWORD_LENGTH) {
       return timer(AuthService.NETWORK_DELAY_MS).pipe(map(() => { throw new Error(`La contrasena debe tener al menos ${AuthService.MIN_PASSWORD_LENGTH} caracteres.`); }));
     }
+    // Intento server-side primero (funciona cross-browser y guarda en txt)
+    return this.http.post<{ saved: boolean }>(AuthService.COMPLETE_REGISTRATION_ENDPOINT, { token, password: newPassword }).pipe(
+      map(() => {
+        // Marcar token local como usado también si existe
+        try {
+          const tokens = this.readRegisterTokens().map(t => t.token === token ? { ...t, usedAt: Date.now() } : t);
+          this.writeJson(AuthService.REGISTER_TOKENS_KEY, tokens);
+        } catch {}
+        this.logout();
+        return void 0;
+      }),
+      catchError((err) => {
+        const serverMsg = err?.error?.error;
+        // Si es error de validación del servidor (token inválido, caducado, duplicado) propagar
+        if (serverMsg) throw new Error(serverMsg);
+        // Si no hay servidor (ng serve) -> fallback local
+        if (err?.status === 404 || err?.status === 0) {
+          return this.completeRegistrationLocalFallback(token, newPassword);
+        }
+        // Intentar fallback local como último recurso
+        return this.completeRegistrationLocalFallback(token, newPassword);
+      })
+    );
+  }
+
+  private completeRegistrationLocalFallback(token: string, newPassword: string): Observable<void> {
     return this.simulateRequest(() => this.consumeTokenChecks(token, AuthService.REGISTER_TOKENS_KEY)).pipe(
       switchMap(regToken =>
         this.userStorage.hashPassword$(newPassword).pipe(
           switchMap(hash => {
-            // Crear usuario via capa de almacenamiento
             const newUser: StoredUser = { email: regToken.email, name: regToken.email.split('@')[0], password: hash };
             return this.userStorage.save(newUser).pipe(
               map(() => {
-                // Marcar token como usado
                 const tokens = this.readRegisterTokens().map(t => t.token === regToken.token ? { ...t, usedAt: Date.now() } : t);
                 this.writeJson(AuthService.REGISTER_TOKENS_KEY, tokens);
                 this.logout();
