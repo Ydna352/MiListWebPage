@@ -203,23 +203,31 @@ export class AuthService {
         this.writeJson(AuthService.REGISTER_TOKENS_KEY, tokens);
         return of(token.token);
       }),
-      switchMap(token =>
-        this.sendRegisterEmail(normalizedEmail, token).pipe(map(emailSent => ({ token, emailSent })))
+      switchMap(localToken =>
+        this.sendRegisterEmail(normalizedEmail, localToken).pipe(map(res => {
+          // El servidor genera un token firmado stateless; usar ese para el link (cross-instance)
+          const effectiveToken = res.token || localToken;
+          if (effectiveToken !== localToken) {
+            // reemplazar el token local por el del servidor para que el link demo funcione
+            const tokens = this.readRegisterTokens().filter(t => t.email !== normalizedEmail);
+            tokens.push({ token: effectiveToken, email: normalizedEmail, expiresAt: Date.now() + AuthService.TOKEN_TTL_MS, usedAt: null });
+            this.writeJson(AuthService.REGISTER_TOKENS_KEY, tokens);
+          }
+          return { token: effectiveToken, emailSent: res.sent };
+        }))
       )
     );
   }
 
-  private sendRegisterEmail(email: string, token: string): Observable<boolean> {
-    return this.http.post<{ sent: boolean; warning?: string }>(AuthService.SEND_REGISTER_ENDPOINT, { email, token }).pipe(
-      map(res => !!res?.sent),
+  private sendRegisterEmail(email: string, token: string): Observable<{ sent: boolean; token: string }> {
+    return this.http.post<{ sent: boolean; warning?: string; token?: string }>(AuthService.SEND_REGISTER_ENDPOINT, { email, token }).pipe(
+      map(res => ({ sent: !!res?.sent, token: res?.token || token })),
       catchError((err) => {
-        // Si el servidor dice 409 el correo ya existe -> propagar error, no silenciar
         const msg = err?.error?.error || err?.message || '';
         if (err?.status === 409 || /ya esta registrado/i.test(msg)) {
-          // Lanzar para que requestRegistration muestre el error en la UI
           throw new Error('El correo ya esta registrado. Intenta iniciar sesion o recupera tu contrasena.');
         }
-        return of(false);
+        return of({ sent: false, token });
       })
     );
   }

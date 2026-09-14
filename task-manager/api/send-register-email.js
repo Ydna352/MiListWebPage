@@ -32,7 +32,7 @@
 const txt = require('./_lib/txtUsers');
 const regTokens = require('./_lib/registerTokens');
 
-const MAX_TOKEN_LENGTH = 100;
+const MAX_TOKEN_LENGTH = 300;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 module.exports = async function handler(request, response) {
@@ -48,7 +48,8 @@ module.exports = async function handler(request, response) {
   if (!EMAIL_PATTERN.test(email)) {
     return response.status(400).json({ error: 'Correo electronico no valido.' });
   }
-  if (!token || token.length > MAX_TOKEN_LENGTH || /[^A-Za-z0-9-]/.test(token)) {
+  if (!token || token.length > MAX_TOKEN_LENGTH || /[^A-Za-z0-9\-_=\.]/i.test(token)) {
+    // permitir UUID y base64url del token firmado
     return response.status(400).json({ error: 'Token no valido.' });
   }
 
@@ -58,25 +59,32 @@ module.exports = async function handler(request, response) {
     return response.status(409).json({ error: 'El correo ya esta registrado.' });
   }
 
-  // Persistir token en servidor (txt) para que el enlace funcione en cualquier navegador
+  // Generar token firmado stateless (no depende de /tmp compartido)
+  // El token del cliente (UUID) se ignora para el correo: usamos uno firmado que
+  // puede validarse en cualquier instancia sin archivo compartido.
+  let serverToken;
   try {
-    regTokens.upsertToken(token, email);
+    serverToken = regTokens.createSignedToken(email);
+    // Guardar opcional para trazabilidad/bloqueo de reuso, pero no es requisito para validar
+    try { regTokens.upsertToken(serverToken, email); } catch {}
   } catch (e) {
-    console.error('[send-register-email] No se pudo persistir token', e);
+    console.error('[send-register-email] No se pudo generar token firmado', e);
     return response.status(500).json({ error: 'No se pudo generar el enlace.' });
   }
+  // Usar el token firmado para el correo (cross-instance)
+  const effectiveToken = serverToken;
 
   const protocol = request.headers['x-forwarded-proto'] || 'https';
   const host = request.headers['x-forwarded-host'] || request.headers.host;
   if (!host) return response.status(400).json({ error: 'No se pudo determinar el dominio.' });
 
-  const registerUrl = `${protocol}://${host}/completar-registro?token=${encodeURIComponent(token)}`;
+  const registerUrl = `${protocol}://${host}/completar-registro?token=${encodeURIComponent(effectiveToken)}`;
 
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) {
     console.error('[send-register-email] Falta RESEND_API_KEY - token guardado, modo demo activo.');
-    // No es error fatal: el usuario puede completar con el link demo, pero avisamos
-    return response.status(200).json({ sent: false, warning: 'Correo no configurado, usa el enlace demo.' });
+    // Devolver el token firmado para que el cliente actualice el link demo (cross-browser)
+    return response.status(200).json({ sent: false, warning: 'Correo no configurado, usa el enlace demo.', token: effectiveToken });
   }
 
   try {
@@ -98,10 +106,11 @@ module.exports = async function handler(request, response) {
     if (!resendResponse.ok) {
       const detail = await resendResponse.text();
       console.error('[send-register-email] Resend respondio', resendResponse.status, detail);
-      return response.status(502).json({ error: 'No se pudo enviar el correo.' });
+      // aunque el correo falle, el token firmado ya es valido, devolverlo para modo demo
+      return response.status(200).json({ sent: false, warning: 'No se pudo enviar el correo.', token: effectiveToken });
     }
 
-    return response.status(200).json({ sent: true });
+    return response.status(200).json({ sent: true, token: effectiveToken });
   } catch (error) {
     console.error('[send-register-email] Fallo la llamada a Resend:', error);
     return response.status(502).json({ error: 'No se pudo enviar el correo.' });
