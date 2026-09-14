@@ -78,17 +78,19 @@ function readTokens() {
 
 function writeTokens(tokens) {
   const txt = serialize(tokens);
+  let tmpSuccess = false;
   let lastError = null;
   for (const dest of [TMP_FILE, DATA_FILE]) {
     try {
       ensureDir(dest);
       fs.writeFileSync(dest, txt, 'utf8');
+      if (dest === TMP_FILE) tmpSuccess = true;
       lastError = null;
       if (dest === TMP_FILE) continue;
       break;
     } catch (e) { lastError = e; }
   }
-  if (lastError) throw lastError;
+  if (!tmpSuccess && lastError) throw lastError;
 }
 
 function cleanExpired(tokens) {
